@@ -13,7 +13,6 @@ htmlcov/
 
 # uv / venv
 .venv/
-uv.lock
 .env
 .env.*
 
@@ -39,5 +38,6 @@ install_token
 # Logs
 *.log
 
-# ngrok
-ngrok.tgz
+.cursor/
+.specify/
+specs/

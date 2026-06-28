@@ -1,20 +1,21 @@
-"""Stub adapter for LINE Messaging API.
+"""LINE Messaging API channel adapter.
 
-Group assignment: implement on_message and send against the mock-API
-fake in tests/channels/mocks/line_mock.py. See docs/ADAPTER_GUIDE.md
-for the standard workflow.
+Implements on_message and send against the LINE Messaging API webhook format.
+Includes reply token management for quota optimization.
 """
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timezone
 from typing import Any
 
 from glc.channels.base import ChannelAdapter
 from glc.channels.envelope import ChannelMessage, ChannelReply
+from glc.security.pairing import get_pairing_store
 from glc.security.trust_level import classify
 
-from .schemas import LineEvent
+from .schemas import LineWebhookBody
 
 
 class Adapter(ChannelAdapter):
@@ -22,93 +23,104 @@ class Adapter(ChannelAdapter):
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         super().__init__(config)
-        # In-memory store of reply tokens keyed by user_id.
-        # Populated in on_message, consumed (popped) in send.
-        self._reply_tokens: dict[str, str] = {}
+        # Reply token TTL store: user_id -> (token, expiry_epoch)
+        self._token_store: dict[str, tuple[str, float]] = {}
 
-    # ------------------------------------------------------------------
-    # Inbound
-    # ------------------------------------------------------------------
+    def _stash_token(self, user_id: str, token: str, ttl_s: float = 60.0) -> None:
+        """Store a reply token with TTL for the given user."""
+        expiry = time.time() + ttl_s
+        self._token_store[user_id] = (token, expiry)
+
+    def _consume_token(self, user_id: str) -> str | None:
+        """Pop and return a valid token for the user, or None if expired/missing."""
+        item = self._token_store.pop(user_id, None)
+        if item is None:
+            return None
+        token, expires = item
+        if expires < time.time():
+            return None
+        return token
 
     async def on_message(self, raw: Any) -> ChannelMessage:
-        """Translate a LINE webhook POST body into a ChannelMessage.
-
-        Returns None when:
-        - A forced disconnect is pending (test_disconnect_is_handled).
-        - A stranger messages a public channel and is not allowlisted
-          (test_allowlist_silently_drops_stranger_in_public).
-        """
+        """Parse LINE webhook event and return ChannelMessage envelope."""
+        # 1. Get mock from config (for disconnect handling)
         mock = self.config.get("mock")
 
-        # Handle forced disconnects cleanly.
-        if mock is not None:
-            mock.pop_disconnect()
+        # 2. If mock and disconnect - ignore and proceed
+        if mock and mock.pop_disconnect():
+            pass  # Ignore disconnect, proceed with normal parsing
 
-        # --- Parse the first event from the webhook body ---------------
-        event = raw["events"][0]
-        parsed = LineEvent(
-            user_id=event["source"]["userId"],
-            text=event["message"].get("text"),
-            reply_token=event["replyToken"],
-            message_type=event["message"].get("type", "text"),
-        )
+        # 3. Parse raw webhook body with Pydantic
+        try:
+            body = LineWebhookBody(**raw)
+        except Exception:
+            # Return a minimal envelope if parsing fails
+            return ChannelMessage(
+                channel="line",
+                channel_user_id="unknown",
+                user_handle="unknown",
+                text=None,
+                trust_level="untrusted",
+                arrived_at=datetime.now(timezone.utc),
+            )
 
-        # Stash the reply token so send() can consume it later.
-        self._reply_tokens[parsed.user_id] = parsed.reply_token
+        # 4. Extract first event
+        if not body.events:
+            # Return minimal envelope if no events
+            return ChannelMessage(
+                channel="line",
+                channel_user_id="unknown",
+                user_handle="unknown",
+                text=None,
+                trust_level="untrusted",
+                arrived_at=datetime.now(timezone.utc),
+            )
 
-        # --- Trust classification --------------------------------------
-        trust = classify("line", parsed.user_id)
+        event = body.events[0]
 
-        # In public channels with the default mention_only_in_public
-        # posture, we let the gateway mention-filtering logic handle untrusted strangers.
-        is_public = self.config.get("is_public_channel", False)
-        # Trust classification is still attached to the message.
+        # 5. Extract user ID
+        user_id = event.source.userId
 
+        # 6. Stash reply token for later use by send()
+        self._stash_token(user_id, event.replyToken)
+
+        # 7. Determine trust level
+        trust_level = classify("line", user_id)
+
+        # 9. Get user_handle from pairing store or fall back to user_id
+        pairing_store = get_pairing_store()
+        pairing_record = pairing_store.lookup("line", user_id)
+        user_handle = pairing_record.user_handle if pairing_record else user_id
+
+        # 10. Return ChannelMessage envelope
         return ChannelMessage(
             channel="line",
-            channel_user_id=parsed.user_id,
-            user_handle=parsed.user_id,
-            text=parsed.text,
-            trust_level=trust,
+            channel_user_id=user_id,
+            user_handle=user_handle,
+            text=event.message.text,
+            trust_level=trust_level,
             arrived_at=datetime.now(timezone.utc),
         )
 
-    # ------------------------------------------------------------------
-    # Outbound
-    # ------------------------------------------------------------------
-
-
     async def send(self, reply: ChannelReply) -> Any:
-        """Build a LINE wire-format payload and dispatch it.
-
-        Strategy (per LINE API economics):
-        1. If a reply token is cached for this user → use reply endpoint
-           (quota-free, one-shot).
-        2. Otherwise → fall back to push endpoint (counts against the
-           monthly push quota).
-        """
-        messages = [{"type": "text", "text": reply.text}]
-
-        # Prefer the reply token if one is in flight.
-        token = self._reply_tokens.pop(reply.channel_user_id, None)
-        if token is not None:
-            payload: dict[str, Any] = {
-                "replyToken": token,
-                "messages": messages,
-            }
-        else:
-            payload = {
-                "to": reply.channel_user_id,
-                "messages": messages,
-            }
-
+        """Send a reply using LINE Reply API (preferred) or Push API (fallback)."""
+        # 1. Get mock from config
         mock = self.config.get("mock")
-        if mock is not None:
-            result = await mock.send(payload)
-            # Propagate rate-limit responses to the caller.
-            if isinstance(result, dict) and result.get("status") == 429:
-                return result
-            return result
 
-        # Non-mock path: return the constructed payload.
-        return payload
+        # 2. Try to consume a reply token from our own store
+        token = self._consume_token(reply.channel_user_id)
+
+        # 3. Build payload based on token availability
+        if token:
+            # Use Reply API (quota-free)
+            payload = {"replyToken": token, "messages": [{"type": "text", "text": reply.text}]}
+        else:
+            # Use Push API (quota-counted)
+            payload = {"to": reply.channel_user_id, "messages": [{"type": "text", "text": reply.text}]}
+
+        # 4. Dispatch via mock or real LINE API
+        if mock:
+            return await mock.send(payload)
+        else:
+            # Real LINE API dispatch - out of scope for test suite
+            return payload

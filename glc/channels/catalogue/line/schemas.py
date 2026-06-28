@@ -1,20 +1,40 @@
-"""Channel-specific Pydantic types for the line adapter. Add types
-here as needed; the canonical ChannelMessage / ChannelReply envelope
-lives in glc.channels.envelope."""
+"""Pydantic schemas for LINE Messaging API webhook parsing.
+
+These models parse the LINE webhook body structure according to:
+https://developers.line.biz/en/reference/messaging-api/#message-event
+"""
 
 from __future__ import annotations
 
 from pydantic import BaseModel
 
 
-class LineEvent(BaseModel):
-    """Parsed fields from a single LINE webhook event.
+class LineWebhookSource(BaseModel):
+    """Source information from LINE webhook event."""
 
-    This is a lightweight projection of the nested webhook dict —
-    just the fields the adapter needs for envelope construction.
-    """
+    userId: str
 
-    user_id: str
+
+class LineWebhookMessage(BaseModel):
+    """Message information from LINE webhook event."""
+
+    id: str
+    type: str
     text: str | None = None
-    reply_token: str
-    message_type: str = "text"
+
+
+class LineWebhookEvent(BaseModel):
+    """Single event from LINE webhook POST body."""
+
+    type: str
+    source: LineWebhookSource
+    message: LineWebhookMessage
+    replyToken: str
+    timestamp: int
+
+
+class LineWebhookBody(BaseModel):
+    """Complete LINE webhook POST body."""
+
+    destination: str
+    events: list[LineWebhookEvent]
