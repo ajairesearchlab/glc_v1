@@ -16,12 +16,14 @@ channels:
   whatsapp:    {enabled: false}
   teams:       {enabled: false}
   matrix:      {enabled: false}
-  line:        {enabled: false}
+  line:
+    enabled: true
+    allowed_senders: ["U3361d2067ed7fa8db66757ead9403f6b"]
   signal:      {enabled: false}
   gmail:       {enabled: false}
   imap:        {enabled: false}
   twilio_sms:  {enabled: false}
-  twilio_voice:{enabled: false}
+  twilio_voice: {enabled: false}
   webui:       {enabled: true}
   webhook:     {enabled: false}
   local_mic:   {enabled: false}

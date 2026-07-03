@@ -12,6 +12,8 @@ dependencies = [
     "jsonschema>=4.21",
     "pyyaml>=6.0",
     "websockets>=12.0",
+    "truststore>=0.9; sys_platform == 'win32'",
+    "dnspython>=2.6",
 ]
 
 [dependency-groups]
